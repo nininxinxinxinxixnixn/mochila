@@ -6,7 +6,7 @@ Una mochila de contexto para Windows: juntá textos, capturas y archivos, ordena
 
 ## Descargar para Windows
 
-Entrá en **Releases**, abrí **Mochila 0.3.0 — versión de prueba** y descargá `Mochila-Windows-0.3.0.zip`. Extraelo y ejecutá `Mochila.exe`. Cerrá cualquier versión anterior antes de abrirla. No necesitás Node ni instalar dependencias para usar la descarga.
+[**Descargar Mochila para Windows**](https://github.com/nininxinxinxinxixnixn/mochila/releases/download/v0.3.0/Mochila-Windows-0.3.0.zip) · [Ver la versión 0.3.0 y el código fuente](https://github.com/nininxinxinxinxixnixn/mochila/releases/tag/v0.3.0). Extraelo y ejecutá `Mochila.exe`. Cerrá cualquier versión anterior antes de abrirla. No necesitás Node ni instalar dependencias para usar la descarga.
 
 ## Cómo funciona
 
