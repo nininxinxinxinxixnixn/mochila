@@ -1,0 +1,337 @@
+/**
+ * System tray icon + context menu.
+ *
+ * The panel has no taskbar button and no window chrome, so the tray is the
+ * user's handle on the app: show/hide, toggle incognito, and quit. Menu item
+ * state (checkmarks) is rebuilt every time the menu opens so it always reflects
+ * current settings.
+ */
+import { Menu, Tray, app, nativeImage, Notification, screen, nativeTheme } from 'electron'
+import { existsSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import { PATHS } from '../store/paths'
+import { loadSettings, saveSettings } from '../store/settings'
+import { getMainWindow, setVisible, repositionWindow, getDisplayListOptions, registerWindowRepositionListener, popUpAndRetract } from './window'
+import type { StickPosition } from '../../shared/types'
+import { pushState } from './state'
+import { TRANSLATIONS, en } from '../../src/i18n/translations'
+
+let tray: Tray | null = null
+let themeListenerRegistered = false
+
+/** Build a tiny monochrome tray icon if no on-disk icon exists (first run). */
+function fallbackIcon(): Electron.NativeImage {
+  // 16x16 transparent PNG with a centered accent dot.
+  const png = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAW0lEQVR4AcXOMQ4AIQhF4eD9' +
+      '/yWhVSChGAyMKlmJUqCYjCDxgi+gnqEVREe0g1FXuATdQI/CBXQMvABjgn0wAbJBHzPmJ2gB' +
+      '1mYAAAAASUVORK5CYII=',
+    'base64'
+  )
+  return nativeImage.createFromBuffer(png).resize({ width: 16, height: 16 })
+}
+
+/**
+ * Detects whether the Windows taskbar/system tray is using light mode.
+ *
+ * Windows 10/11 allows a "Custom" theme where the taskbar (Windows mode)
+ * can be Light while apps are Dark (or vice versa).
+ * The authoritative source is the registry key `SystemUsesLightTheme`:
+ *   1 = Light taskbar (requires dark tray icon)
+ *   0 = Dark taskbar (requires white tray icon)
+ *
+ * Falls back to `!nativeTheme.shouldUseDarkColors` on non-Windows or when unreadable.
+ */
+export function isTaskbarLightTheme(): boolean {
+  if (process.platform === 'win32') {
+    try {
+      const out = execFileSync(
+        'reg',
+        ['query', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize', '/v', 'SystemUsesLightTheme'],
+        { windowsHide: true, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
+      )
+      const text = String(out ?? '')
+      const m = text.match(/SystemUsesLightTheme\s+REG_DWORD\s+(0x[0-9a-fA-F]+|\d+)/i)
+      if (m && m[1]) {
+        const val = parseInt(m[1], 16)
+        return val === 1
+      }
+    } catch {
+      // Best-effort registry check; fall back to nativeTheme below.
+    }
+  }
+  return !nativeTheme.shouldUseDarkColors
+}
+
+/** Resolves the appropriate 32x32 tray icon based on the current taskbar theme. */
+export function getTrayImage(): Electron.NativeImage {
+  const isLight = isTaskbarLightTheme()
+  const preferredPath = isLight ? PATHS.trayDarkIcon() : PATHS.trayIcon()
+  const fallbackPath = PATHS.trayIcon()
+
+  const resolvedPath = existsSync(preferredPath)
+    ? preferredPath
+    : (existsSync(fallbackPath) ? fallbackPath : null)
+
+  if (resolvedPath) {
+    // Load and resize to exactly 32x32. Windows system tray renders icons at 16x16
+    // logical pixels but uses 32x32 physical pixels on 2x DPI displays.
+    // Using a single 32x32 image with no scaleFactor trickery is the most reliable
+    // approach — the OS scales it automatically.
+    return nativeImage.createFromPath(resolvedPath).resize({ width: 32, height: 32, quality: 'best' })
+  }
+
+  return fallbackIcon()
+}
+
+/** Dynamically switches tray icon image when system/taskbar theme updates. */
+export function updateTrayIcon(): void {
+  if (!tray || tray.isDestroyed()) return
+  try {
+    const image = getTrayImage()
+    tray.setImage(image)
+  } catch (err) {
+    console.error('[Tray] Failed to update tray icon image:', err)
+  }
+}
+
+export function createTray(): Tray {
+  const image = getTrayImage()
+  tray = new Tray(image)
+  tray.setToolTip('Edge-Drop')
+
+  // Register system theme change listener once
+  if (!themeListenerRegistered) {
+    themeListenerRegistered = true
+    nativeTheme.on('updated', () => {
+      updateTrayIcon()
+    })
+  }
+
+  // Show welcome notification on first run
+  if (!existsSync(PATHS.indexFile())) {
+    try {
+      if (Notification.isSupported()) {
+        const initialSettings = loadSettings()
+        new Notification({
+          title: getTrayText(initialSettings.language, 'welcomeTitle'),
+          body: getTrayText(initialSettings.language, 'welcomeBody'),
+          icon: PATHS.icon()
+        }).show()
+      }
+    } catch { /* ignore */ }
+  }
+
+  function buildDisplaySubmenu(): Electron.MenuItemConstructorOptions[] {
+    const options = getDisplayListOptions()
+    return options.map((d) => ({
+      label: d.label,
+      type: 'radio' as const,
+      checked: d.isCurrent,
+      click: () => {
+        // Persist workArea (not bounds) — geometry.ts Tier-2 fuzzy match compares
+        // d.workArea against savedWorkArea. Storing bounds (which includes the taskbar)
+        // causes a ~40px mismatch that exceeds BOUNDS_TOLERANCE, breaking cross-reboot recovery.
+        const next = saveSettings({
+          stickDisplayId: d.id,
+          stickDisplayWorkArea: d.workArea,
+          stickDisplayScaleFactor: d.scaleFactor
+        })
+        pushState.settings(next)
+        repositionWindow()
+        popUpAndRetract(1500)
+        rebuild()
+      }
+    }))
+  }
+
+  function buildStickSubmenu(current: StickPosition): Electron.MenuItemConstructorOptions[] {
+    const settings = loadSettings()
+    return ([
+      { pos: 'left' as const, labelKey: 'left' as const },
+      { pos: 'right' as const, labelKey: 'right' as const },
+      { pos: 'top' as const, labelKey: 'top' as const }
+    ]).map(({ pos, labelKey }) => ({
+      label: getTrayText(settings.language, labelKey as any) || (pos === 'top' ? 'Top' : pos),
+      type: 'radio' as const,
+      checked: current === pos,
+      click: () => {
+        const next = saveSettings({ stickPosition: pos })
+        pushState.settings(next)
+        repositionWindow()
+        popUpAndRetract(1500)
+        rebuild()
+      }
+    }))
+  }
+
+function getTrayText(settingsLang: string | undefined, key: keyof typeof en['tray']): string {
+  let langCode = settingsLang || 'system'
+  if (langCode === 'system') {
+    const sysLangs = app.getPreferredSystemLanguages()
+    const first = (sysLangs[0] || '').toLowerCase()
+    if (first.startsWith('zh-tw') || first.startsWith('zh-hk')) langCode = 'zh-TW'
+    else if (first.startsWith('zh')) langCode = 'zh-CN'
+    else if (first.startsWith('es')) langCode = 'es'
+    else if (first.startsWith('fr')) langCode = 'fr'
+    else if (first.startsWith('de')) langCode = 'de'
+    else if (first.startsWith('hi')) langCode = 'hi'
+    else if (first.startsWith('ja')) langCode = 'ja'
+    else if (first.startsWith('ru')) langCode = 'ru'
+    else if (first.startsWith('it')) langCode = 'it'
+    else if (first.startsWith('pt')) langCode = 'pt'
+    else if (first.startsWith('ko')) langCode = 'ko'
+    else if (first.startsWith('ar')) langCode = 'ar'
+    else if (first.startsWith('fa')) langCode = 'fa'
+    else if (first.startsWith('bn')) langCode = 'bn'
+    else if (first.startsWith('tr')) langCode = 'tr'
+    else if (first.startsWith('vi')) langCode = 'vi'
+    else if (first.startsWith('pl')) langCode = 'pl'
+    else if (first.startsWith('nl')) langCode = 'nl'
+    else if (first.startsWith('sv')) langCode = 'sv'
+    else if (first.startsWith('id')) langCode = 'id'
+    else if (first.startsWith('uk')) langCode = 'uk'
+    else if (first.startsWith('el')) langCode = 'el'
+    else if (first.startsWith('cs')) langCode = 'cs'
+    else if (first.startsWith('ro')) langCode = 'ro'
+    else if (first.startsWith('hu')) langCode = 'hu'
+    else if (first.startsWith('da')) langCode = 'da'
+    else if (first.startsWith('fi')) langCode = 'fi'
+    else if (first.startsWith('th')) langCode = 'th'
+    else if (first.startsWith('he')) langCode = 'he'
+    else if (first.startsWith('no') || first.startsWith('nb') || first.startsWith('nn')) langCode = 'no'
+    else langCode = 'en'
+  }
+  const dict = TRANSLATIONS[langCode]
+  return (dict?.tray?.[key]) || en.tray[key] || key
+}
+
+  const rebuild = () => {
+    const settings = loadSettings()
+    const t = (k: keyof typeof en['tray']) => getTrayText(settings.language, k)
+
+    const menu = Menu.buildFromTemplate([
+      {
+        label: t('showClipboard'),
+        click: () => {
+          console.log('[Main] Context menu "Show Clipboard" clicked')
+          setVisible(true)
+          getMainWindow()?.focus()
+          pushState.togglePanel()
+        }
+      },
+      {
+        label: t('settings'),
+        click: () => {
+          console.log('[Main] Context menu "Settings" clicked')
+          setVisible(true)
+          getMainWindow()?.focus()
+          pushState.openSettings()
+        }
+      },
+      { type: 'separator' },
+      {
+        label: t('incognito'),
+        type: 'checkbox',
+        checked: settings.incognito,
+        click: (item) => {
+          const next = saveSettings({ incognito: item.checked })
+          pushState.settings(next)
+          applyIncognito(next.incognito)
+          rebuild()
+        }
+      },
+      {
+        label: t('hoverTrigger'),
+        type: 'checkbox',
+        checked: settings.hoverActivation ?? true,
+        click: (item) => {
+          const next = saveSettings({
+            hoverActivation: item.checked,
+            suppressInFullscreen: item.checked ? true : false
+          })
+          pushState.settings(next)
+          rebuild()
+        }
+      },
+      { type: 'separator' },
+      {
+        label: t('stickTo'),
+        submenu: buildStickSubmenu(settings.stickPosition)
+      },
+      {
+        label: t('display'),
+        submenu: buildDisplaySubmenu()
+      },
+      { type: 'separator' },
+      {
+        label: t('quit'),
+        click: () => {
+          app.quit()
+        }
+      }
+    ])
+    tray?.setContextMenu(menu)
+  }
+
+  tray.on('click', () => {
+    updateTrayIcon()
+    console.log('[Main] Tray icon left-clicked')
+    const win = getMainWindow()
+    if (!win) return
+    setVisible(true)
+    pushState.togglePanel()
+  })
+
+  // Rebuild menu dynamically right before showing to ensure displays & checkmarks are 100% current.
+  tray.on('right-click', () => {
+    updateTrayIcon()
+    rebuild()
+    tray?.popUpContextMenu()
+  })
+
+  // Listen for display changes to keep tray context menu updated in real-time (register once).
+  if (!screenListenersRegistered) {
+    screenListenersRegistered = true
+    screen.on('display-added', () => trayMenuRebuilder?.())
+    screen.on('display-removed', () => trayMenuRebuilder?.())
+    screen.on('display-metrics-changed', () => trayMenuRebuilder?.())
+    registerWindowRepositionListener(() => trayMenuRebuilder?.())
+  }
+
+  trayMenuRebuilder = rebuild
+  rebuild()
+  return tray
+}
+
+let screenListenersRegistered = false
+let trayMenuRebuilder: (() => void) | null = null
+
+export function rebuildTrayMenu(): void {
+  trayMenuRebuilder?.()
+}
+
+/**
+ * Destroys and safely recreates the tray icon.
+ * Used when Windows Explorer restarts/crashes (TaskbarCreated event).
+ */
+export function refreshTray(): void {
+  try {
+    if (tray && !tray.isDestroyed()) {
+      tray.destroy()
+      tray = null
+    }
+  } catch (err) {
+    console.error('[Tray] Error destroying old tray on refresh:', err)
+  }
+  createTray()
+}
+
+/** Reflect incognito toggle into the watcher without the renderer round-trip. */
+let incognitoApply: ((v: boolean) => void) | null = null
+export function registerIncognitoApplier(fn: (v: boolean) => void): void {
+  incognitoApply = fn
+}
+function applyIncognito(v: boolean): void {
+  incognitoApply?.(v)
+}

@@ -1,0 +1,946 @@
+/**
+ * IPC handler registration.
+ *
+ * Each `ipcMain.handle` here mirrors a contract in `shared/ipc.ts`. The
+ * renderer calls them through the typed preload bridge, so a signature mismatch
+ * is a compile-time error rather than a runtime one.
+ */
+import { app, ipcMain, clipboard, nativeImage, shell, net } from 'electron'
+import { existsSync } from 'node:fs'
+import { execFile } from 'node:child_process'
+import { psHost, getSystemPowerShellPath, getWritableCwd } from './powershell'
+import { filterValidPaths, isExistingFilePath } from './pathValidation'
+import { type InvokeMap, type InvokeChannel, type SendMap, type SendChannel } from '../../shared/ipc'
+import { getStore, loadSettings, saveSettings, pushState, addFiles, getWatcher } from './state'
+import { sendToMainWindow, setInteractive, setHeartbeatPaused, setHotZoneWidth, repositionWindow, getDisplayListOptions, popUpAndRetract, setWindowFocusable, captureExternalForeground, traceFg, resolvePasteTarget } from './window'
+import { registerGlobalHotkey } from './index'
+import { getOnboardingWindow } from './onboardingWindow'
+import { rebuildTrayMenu } from './tray'
+import { startDragOut, resolveDragData, prestageDrag, stageDragFile } from './drag'
+import { clipboardSignature, formatTabularDataForClipboard, signatureMatchesItem } from '../clipboard/formats'
+import type { ClipboardItem, ItemData, MergeResult } from '../../shared/types'
+import { quitAndInstallUpdate, checkForUpdatesManual, startUpdateDownload, syncAutoUpdaterState, getCachedUpdateState, triggerBackgroundCheck } from './updater'
+import { createId } from '../store/ids'
+import { isStoreBuild } from './config'
+import { applyLaunchAtLogin, refreshLaunchAtLoginFromOs } from './loginItems'
+import { toUnpackagedFilePath, toUnpackagedFilePaths } from '../store/paths'
+import { isPasteableEmoji } from '../../shared/emoji'
+
+export { isStoreBuild }
+
+/**
+ * Returns true if the current system clipboard content matches the given item data.
+ *
+ * Delegates to the pure, unit-tested matcher in formats.ts, which strips the
+ * Win32 sequence-number prefix before comparing — without that strip, text
+ * ownership checks could never match on real Windows sessions.
+ *
+ * Used before delete/clear to decide whether to clear the system clipboard.
+ * Clearing is only done when the deleted item IS the thing currently on the
+ * clipboard; deleting an old history entry that the user has since replaced
+ * must never wipe their current clipboard contents.
+ */
+function clipboardMatchesItem(item: ClipboardItem): boolean {
+  const fullText =
+    item.data.kind === 'text' && item.data.hasFullPayload
+      ? getStore().getFullText(item.id)
+      : undefined
+  return signatureMatchesItem(clipboardSignature(), item.data, fullText)
+}
+
+/** Fire a transient toast to the renderer (best-effort; renderer may be closed). Message is a translation key resolved renderer-side; params fill {placeholders}. */
+function toast(message: string, tone: 'info' | 'error' = 'info', params?: Record<string, string | number>): void {
+  sendToMainWindow('ui:toast', { id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, message, tone, params })
+}
+
+/** Simulate pressing Ctrl+V via PowerShell after returning focus to the previous active window. */
+function simulatePaste(): void {
+  if (process.platform === 'win32') {
+    // Run via the persistent powershell host for near-zero latency (no process spawn overhead)
+    psHost.run("Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('^v')", 2000)
+      .catch((err) => {
+        console.error('[Main] simulatePaste psHost failed, using fallback:', err)
+        // Fallback to spawning powershell process via absolute system path
+        execFile(getSystemPowerShellPath(), [
+          '-NoProfile',
+          '-NonInteractive',
+          '-Command',
+          "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('^v')"
+        ], { windowsHide: true, ...(isStoreBuild() ? { cwd: getWritableCwd() } : {}) }, (fallbackErr) => {
+          if (fallbackErr) console.error('[Main] simulatePaste fallback error:', fallbackErr)
+        })
+      })
+  }
+}
+
+/**
+ * Write file *references* onto the system clipboard so that paste in Explorer,
+ * Word, Slack, and every other shell-aware app copies the actual files.
+ *
+ * WHY POWERSHELL: Electron's clipboard API calls EmptyClipboard() on every
+ * write. Sequential calls (writeBuffer then writeText) leave only the LAST
+ * format — which was always the plain path string, making every paste land as
+ * text. PowerShell's Clipboard.SetFileDropList writes CF_HDROP + FileNameW +
+ * Shell IDList Array + all other shell formats in a single atomic transaction.
+ * Paths are base64-encoded so any character (spaces, quotes, Unicode) is safe.
+ *
+ * Returns false when no valid path remained (e.g. every source file was
+ * deleted since capture) so callers can surface an explicit error.
+ */
+async function writeFileListToClipboard(rawPaths: string[]): Promise<boolean> {
+  const validPaths = toUnpackagedFilePaths(filterValidPaths(rawPaths))
+  if (validPaths.length === 0) return false
+  if (process.platform === 'win32') {
+    try {
+      const addLines = validPaths
+        .map(p => `$c.Add([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${Buffer.from(p, 'utf8').toString('base64')}')))|Out-Null`)
+        .join(';')
+      const script = [
+        'Add-Type -AssemblyName System.Windows.Forms',
+        '$c=New-Object System.Collections.Specialized.StringCollection',
+        addLines,
+        '[Windows.Forms.Clipboard]::SetFileDropList($c)'
+      ].join(';')
+      await psHost.run(script, 3000)
+      return true
+    } catch (err) {
+      console.error('[ipc] writeFileListToClipboard PowerShell failed, using text fallback:', err)
+    }
+  }
+  // Non-Windows / PowerShell failure fallback: plain text paths (best-effort)
+  clipboard.clear()
+  clipboard.writeText(validPaths.join('\r\n'))
+  return true
+}
+
+/**
+ * Write a full-resolution bitmap onto the system clipboard.
+ *
+ * Deliberately does NOT fall back to the low-res renderer preview: silently
+ * pasting a 240px thumbnail when the original vanished is worse than an
+ * explicit failure. Returns false so callers can show a precise toast.
+ */
+export async function writeImageToClipboard(imagePath: string | null): Promise<boolean> {
+  if (imagePath && existsSync(imagePath)) {
+    try {
+      const img = nativeImage.createFromPath(imagePath)
+      if (!img.isEmpty()) {
+        clipboard.clear()
+        clipboard.writeImage(img)
+        return true
+      }
+    } catch (err) {
+      console.error('[ipc] writeImageToClipboard nativeImage.createFromPath failed:', err)
+    }
+  }
+  return false
+}
+
+/**
+ * Bitmap for apps that read CF_DIB, plus a named file so Explorer paste keeps
+ * our friendly filename. Atomic multi-format write via PowerShell DataObject.
+ */
+async function writeImageWithNamedFile(imagePath: string, namedPath: string): Promise<boolean> {
+  if (process.platform !== 'win32') return false
+  try {
+    const b64Img = Buffer.from(imagePath, 'utf8').toString('base64')
+    const b64File = Buffer.from(namedPath, 'utf8').toString('base64')
+    const script = [
+      'Add-Type -AssemblyName System.Windows.Forms',
+      'Add-Type -AssemblyName System.Drawing',
+      `$img=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64Img}'))`,
+      `$fp=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64File}'))`,
+      '$bmp=[Drawing.Image]::FromFile($img)',
+      '$d=New-Object Windows.Forms.DataObject',
+      '$d.SetImage($bmp)',
+      '$c=New-Object System.Collections.Specialized.StringCollection',
+      '$c.Add($fp)|Out-Null',
+      '$d.SetFileDropList($c)',
+      '[Windows.Forms.Clipboard]::SetDataObject($d,$true)',
+      '$bmp.Dispose()'
+    ].join(';')
+    await psHost.run(script, 3000)
+    return true
+  } catch (err) {
+    console.error('[ipc] writeImageWithNamedFile failed:', err)
+    return false
+  }
+}
+
+/**
+ * Type-checked registration helper: guarantees the handler's return matches the
+ * contract declared in InvokeMap.
+ */
+function handle<C extends InvokeChannel>(
+  channel: C,
+  fn: (...args: InvokeMap[C]['args']) => Promise<InvokeMap[C]['result']> | InvokeMap[C]['result']
+): void {
+  ipcMain.handle(channel, (_e, ...args) => fn(...(args as InvokeMap[C]['args'])))
+}
+
+/** Apply launch-at-login to the OS and return the state Windows actually kept. */
+export async function syncLoginItemSettings(launchAtLogin?: boolean): Promise<void> {
+  const wantLaunch = launchAtLogin ?? loadSettings().launchAtLogin
+  const result = await applyLaunchAtLogin(wantLaunch)
+  if (!result.ok) {
+    console.error('[IPC] launch-at-login apply did not stick. wanted=', wantLaunch, 'result=', result)
+  }
+}
+
+export function registerIpc(): void {
+  handle('state:load', () => {
+    return {
+      items: getStore().toDto(),
+      settings: loadSettings(),
+      version: app.getVersion(),
+      isStoreBuild: isStoreBuild(),
+      updateInfo: getCachedUpdateState()
+    }
+  })
+
+  handle('app:install-update', () => {
+    if (isStoreBuild()) return
+    console.log('[IPC] app:install-update requested by renderer — calling quitAndInstallUpdate')
+    quitAndInstallUpdate()
+  })
+
+  handle('updater:check-manual', async () => {
+    if (isStoreBuild()) return { status: 'up-to-date', version: app.getVersion() }
+    return checkForUpdatesManual()
+  })
+
+  handle('updater:start-download', async () => {
+    if (isStoreBuild()) return
+    await startUpdateDownload()
+  })
+
+  handle('updater:get-state', async () => {
+    if (isStoreBuild()) return null
+    return getCachedUpdateState()
+  })
+
+  handle('app:quit', () => {
+    console.log('[IPC] app:quit requested by renderer — quitting application')
+    app.quit()
+  })
+
+  handle('file:reveal', (filePath) => {
+    if (isExistingFilePath(filePath)) {
+      try {
+        shell.showItemInFolder(filePath)
+        return true
+      } catch (err) {
+        console.error('[IPC] file:reveal failed:', err)
+      }
+    }
+    return false
+  })
+
+  handle('item:set-pinned', (id, pinned) => {
+    getStore().setPinned(id, pinned)
+    return getStore().toDto()
+  })
+
+  handle('item:delete', (id) => {
+    const item = getStore().get(id)
+    const watcher = getWatcher()
+    // Pause first: an in-flight settle timer from the copy that created this
+    // item would otherwise readClipboard() after we splice and put it back.
+    watcher.setPaused(true)
+    try {
+      // Resolve clipboard ownership BEFORE mutating the store: if this exact
+      // content still sits on the system clipboard it must be cleared first so
+      // (a) the staged-temp cleanup inside delete() can never yank a file from
+      // under a live OS clipboard reference, and (b) resyncSignature() below
+      // locks onto an EMPTY clipboard, making an immediate re-copy of the same
+      // content a detectable change instead of an invisible no-op.
+      if (item && clipboardMatchesItem(item)) {
+        clipboard.clear()
+      }
+      getStore().delete(id)
+    } finally {
+      watcher.resyncSignature()
+      watcher.setPaused(loadSettings().incognito)
+    }
+    pushState.items()
+    return getStore().toDto()
+  })
+
+  handle('item:delete-batch', (ids) => {
+    if (!ids || ids.length === 0) return getStore().toDto()
+    const items = ids.map((id) => getStore().get(id)).filter((item): item is ClipboardItem => !!item)
+    const watcher = getWatcher()
+    watcher.setPaused(true)
+    try {
+      if (items.some((item) => clipboardMatchesItem(item))) {
+        clipboard.clear()
+      }
+      getStore().deleteBatch(ids)
+    } finally {
+      watcher.resyncSignature()
+      watcher.setPaused(loadSettings().incognito)
+    }
+    pushState.items()
+    return getStore().toDto()
+  })
+
+  handle('item:clear', () => {
+    // Wipe the system clipboard BEFORE the store: nothing the user just
+    // cleared may zombie-reappear, and every removed item's staged temp
+    // files become safe to reap inside clearUnpinned().
+    clipboard.clear()
+    getStore().clearUnpinned()
+    getWatcher().resyncSignature()
+    pushState.items()
+    return getStore().toDto()
+  })
+
+  handle('item:get-full-text', (id) => {
+    return getStore().getFullText(id)
+  })
+
+  handle('item:copy', async (id) => {
+    const item = getStore().get(id)
+    console.log('[IPC] item:copy id=', id, 'found=', !!item)
+    if (!item) return false
+
+    const watcher = getWatcher()
+    watcher.setPaused(true)
+    const fullText = item.data.kind === 'text' ? getStore().getFullText(id) : undefined
+    const itemDataWithFullText = item.data.kind === 'text' && fullText ? { ...item.data, text: fullText } : item.data
+    const ok = await writeItemToClipboard(itemDataWithFullText, item.capturedAt)
+    if (!ok) {
+      // Source content (e.g. the staged image file) is unrecoverable. Do not
+      // promote a dead item to the top of history — tell the user instead.
+      console.log('[IPC] item:copy aborted — source content unavailable')
+      toast('toast.imageUnavailable', 'error')
+      setTimeout(() => {
+        watcher.setPaused(loadSettings().incognito)
+      }, 200)
+      return false
+    }
+    console.log('[IPC] item:copy wrote to clipboard, kind=', item.data.kind)
+
+    // Promote: touch() bumps recency WITHOUT re-interpreting content.
+    // Re-adding here duplicated long texts — their stored 300-char preview
+    // signature differs from the full payload, so add() saw "new content"
+    // and created a second entry.
+    getStore().touch(id)
+    pushState.items({ reason: 'usage' })
+
+    // Unpause after a short delay to allow OS clipboard event to settle.
+    // Respect the current incognito state when unpausing.
+    setTimeout(() => {
+      watcher.setPaused(loadSettings().incognito)
+    }, 200)
+
+    return true
+  })
+
+  handle('item:copy-subitem', async (req) => {
+    // Resolve a single sub-item (one file of a bundle, or one image of a
+    // collection) and write just that onto the clipboard — not the whole item.
+    const dto = getStore().toDto().find((d) => d.id === req.id)
+    if (!dto) return false
+
+    let wrote = false
+    if (dto.data.kind === 'files' && req.paths && req.paths.length > 0) {
+      // Write real file references so pasting into Explorer copies the file,
+      // not a path string.
+      wrote = await writeFileListToClipboard(req.paths)
+      if (!wrote) toast('toast.fileUnavailable', 'error')
+    } else if (dto.data.kind === 'image-collection' && req.imageId) {
+      const img = dto.data.images.find((i) => i.imageId === req.imageId)
+      if (img) {
+        // Single image from a collection: write full bitmap + file reference atomically.
+        const src = getStore().resolveStoredImagePath(img.imageId, img.ext)
+        wrote = await writeImageToClipboard(src)
+        if (!wrote) toast('toast.imageUnavailable', 'error')
+      }
+    }
+
+    if (!wrote) return false
+
+    // Promote the parent bundle to the top — touch() keeps content/signature
+    // intact (re-add risked duplicate long-text entries, same as item:copy).
+    if (getStore().get(req.id)) {
+      getStore().touch(req.id)
+      pushState.items({ reason: 'usage' })
+    }
+
+    const watcher = getWatcher()
+    watcher.setPaused(true)
+    setTimeout(() => {
+      watcher.setPaused(loadSettings().incognito)
+    }, 200)
+
+    return true
+  })
+
+  // ---------------------------------------------------------------------------
+  // Paste guard — prevents double-paste from rapid/double clicks.
+  // Stored at module scope so it's authoritative across all renderer invocations.
+  // The renderer-side tryPaste() is a best-effort pre-filter; this is the hard gate.
+  // ---------------------------------------------------------------------------
+  let _lastPasteTime = 0
+  const PASTE_GUARD_MS = 600
+  let _lastEmojiPasteTime = 0
+  const EMOJI_PASTE_GUARD_MS = 180
+
+  handle('item:paste', async (id) => {
+    const now = Date.now()
+    if (now - _lastPasteTime < PASTE_GUARD_MS) {
+      console.log('[IPC] item:paste blocked — too soon after last paste')
+      return false
+    }
+    _lastPasteTime = now
+
+    const item = getStore().get(id)
+    console.log('[IPC] item:paste id=', id, 'found=', !!item)
+    if (!item) return false
+
+    // Fast pre-flight BEFORE any UI state changes: if the source content is
+    // unrecoverable (e.g. the staged image file vanished), abort with an
+    // explicit message while the panel is still open — never close the shelf
+    // and then silently paste nothing / a blurry thumbnail.
+    if (
+      (item.data.kind === 'image' && !getStore().resolveStoredImagePath(item.data.imageId, item.data.ext)) ||
+      (item.data.kind === 'image-collection' && !getStore().hasRecoverableCollectionImage(item.data.images))
+    ) {
+      console.log('[IPC] item:paste aborted — source image no longer available')
+      toast('toast.imageUnavailable', 'error')
+      return false
+    }
+
+    const watcher = getWatcher()
+    watcher.setPaused(true)
+
+    try {
+      // 1. Close panel immediately so Edge-Drop slides shut with 0ms UI lag
+      pushState.togglePanel(false)
+
+      // 2. Write item to system clipboard
+      const fullText = item.data.kind === 'text' ? getStore().getFullText(id) : undefined
+      const itemDataWithFullText = item.data.kind === 'text' && fullText ? { ...item.data, text: fullText } : item.data
+      const ok = await writeItemToClipboard(itemDataWithFullText, item.capturedAt)
+      if (!ok) {
+        // Extremely rare race: source vanished between pre-check and write.
+        toast('toast.imageUnavailable', 'error')
+        return false
+      }
+      console.log('[IPC] item:paste wrote to clipboard, kind=', item.data.kind)
+
+      // 3. Touch item timestamp if enabled
+      const settings = loadSettings()
+      if (settings.movePastedToTop !== false) {
+        getStore().touch(id)
+      }
+
+      // 4. Keys under the uniform rule: clipboard is already written, so
+      // resolve WHERE they may go. Verified target -> send after settle;
+      // unrecoverable foreground -> toast, never fire blind.
+      const sendDelay = await resolvePasteTarget(50)
+      if (sendDelay < 0) {
+        toast('toast.pasteFallback', 'info')
+      } else {
+        setTimeout(() => {
+          traceFg('sendKeys')
+          simulatePaste()
+          setTimeout(() => traceFg('sendKeys+400ms'), 400)
+        }, sendDelay)
+      }
+
+      // 5. Broadcast updated items list after panel has fully closed off-screen (250ms)
+      if (settings.movePastedToTop !== false) {
+        setTimeout(() => {
+          pushState.items()
+        }, 250)
+      }
+    } finally {
+      // Resync the watcher signature after paste so standard OS Ctrl+V does NOT
+      // increment item hitCounts or re-order items.
+      setTimeout(() => {
+        watcher.resyncSignature()
+        watcher.setPaused(loadSettings().incognito)
+      }, 350)
+    }
+
+    return true
+  })
+
+  handle('item:paste-subitem', async (req) => {
+    const now = Date.now()
+    if (now - _lastPasteTime < PASTE_GUARD_MS) {
+      console.log('[IPC] item:paste-subitem blocked — too soon after last paste')
+      return false
+    }
+    _lastPasteTime = now
+
+    const dto = getStore().toDto().find((d) => d.id === req.id)
+    if (!dto) return false
+
+    const watcher = getWatcher()
+    watcher.setPaused(true)
+
+    try {
+      let wrote = false
+      if (dto.data.kind === 'files' && req.paths && req.paths.length > 0) {
+        wrote = await writeFileListToClipboard(req.paths)
+      } else if (dto.data.kind === 'image-collection' && req.imageId) {
+        const img = dto.data.images.find((i) => i.imageId === req.imageId)
+        if (img) {
+          // Single image from a collection: write full bitmap + file reference atomically.
+          const src = getStore().resolveStoredImagePath(img.imageId, img.ext)
+          wrote = await writeImageToClipboard(src)
+          if (!wrote) toast('toast.imageUnavailable', 'error')
+        }
+      }
+
+      if (!wrote) return false
+
+      // DO NOT promote/bump hitCount here — same reason as item:paste.
+      // Only the watcher (genuine user Ctrl+C) should increment hitCount.
+
+      // Pass false to explicitly close and avoid toggle race conditions.
+      pushState.togglePanel(false)
+
+      // Wait for layout updates, then keys under the uniform rule.
+      const subSendDelay = await resolvePasteTarget(50)
+      if (subSendDelay < 0) {
+        toast('toast.pasteFallback', 'info')
+      } else {
+        setTimeout(() => {
+          traceFg('sendKeys')
+          simulatePaste()
+          setTimeout(() => traceFg('sendKeys+400ms'), 400)
+        }, subSendDelay)
+      }
+    } finally {
+      setTimeout(() => {
+        watcher.invalidateSignature()
+        watcher.setPaused(loadSettings().incognito)
+      }, 350)
+    }
+
+    return true
+  })
+
+  handle('emoji:paste', async (text) => {
+    if (!isPasteableEmoji(text)) return false
+    const now = Date.now()
+    if (now - _lastEmojiPasteTime < EMOJI_PASTE_GUARD_MS) return false
+    _lastEmojiPasteTime = now
+
+    const watcher = getWatcher()
+    watcher.setPaused(true)
+    try {
+      // Write + Ctrl+V only. Do NOT add() to history — picker inserts are a
+      // paste tool, not a capture. resyncSignature() so this write is not
+      // seen as a new capture when the watcher resumes. A later copy of the
+      // same emoji from another app still lands: signatures include the Win32
+      // sequence number, so an outside Ctrl+C is a new seq and is recorded.
+      clipboard.writeText(text.trim())
+      const emojiSendDelay = await resolvePasteTarget(40)
+      if (emojiSendDelay < 0) {
+        toast('toast.pasteFallback', 'info')
+      } else {
+        setTimeout(() => {
+          traceFg('sendKeys')
+          simulatePaste()
+          setTimeout(() => traceFg('sendKeys+400ms'), 400)
+        }, emojiSendDelay)
+      }
+    } finally {
+      setTimeout(() => {
+        watcher.resyncSignature()
+        watcher.setPaused(loadSettings().incognito)
+      }, 350)
+    }
+    return true
+  })
+
+  handle('item:add-files', (paths) => {
+    const result = addFiles(paths)
+    // If a large drop was split into several stacks, let the user know why
+    // they suddenly see multiple items instead of one bundle.
+    if (result.stacksCreated > 1) {
+      toast('toast.splitStacks', 'info', { count: result.stacksCreated })
+    }
+    return getStore().toDto()
+  })
+
+  handle('item:add-data', async (data) => {
+    if (!data) return getStore().toDto()
+
+    if (data.kind === 'files' && data.paths && data.paths.length > 0) {
+      const result = addFiles(data.paths)
+      if (result.stacksCreated > 1) {
+        toast('toast.splitStacks', 'info', { count: result.stacksCreated })
+      }
+      return getStore().toDto()
+    }
+
+    if (data.kind === 'image' && (data as any).imageUrl) {
+      const imageUrl = (data as any).imageUrl as string
+      if (/^file:/i.test(imageUrl)) {
+        const local = imageUrl.replace(/^file:\/\//i, '').replace(/^\/([a-zA-Z]:)/, '$1')
+        try {
+          const decoded = decodeURIComponent(local).replace(/\//g, '\\')
+          if (existsSync(decoded)) {
+            addFiles([decoded])
+            return getStore().toDto()
+          }
+        } catch { /* fall through to bitmap import */ }
+      }
+      try {
+        let img = nativeImage.createFromDataURL(imageUrl)
+        if (img.isEmpty() && /^https?:\/\//i.test(imageUrl)) {
+          const res = await net.fetch(imageUrl)
+          if (res.ok) {
+            const arrayBuf = await res.arrayBuffer()
+            img = nativeImage.createFromBuffer(Buffer.from(arrayBuf))
+          }
+        }
+        if (!img.isEmpty()) {
+          let png: Buffer | null = img.toPNG()
+          const size = img.getSize()
+          data.imageId = createId()
+          data.bytes = png.length
+          data.width = size.width
+          data.height = size.height
+          data.ext = 'png'
+          data.source = 'image'
+          const fromUrl = imageUrl.split(/[\\/]/).pop()?.split('?')[0]
+          if (fromUrl && /\.(png|jpe?g|gif|webp|bmp|svg|avif)$/i.test(fromUrl)) {
+            data.fileName = decodeURIComponent(fromUrl)
+          }
+          getStore().stageImageBytes(data.imageId, png)
+          png = null
+          img = null as any
+        }
+      } catch (err) {
+        console.error('[IPC] Failed to process dropped web image URL:', err)
+      }
+    }
+
+    getStore().add(data, loadSettings().historyLimit)
+    // Manual drag-in import (text/URL/web image dropped onto the shelf):
+    // bookkeeping, not a capture — suppress the copy indicator.
+    pushState.items({ reason: 'usage' })
+    return getStore().toDto()
+  })
+
+  handle('item:remove-subitem', (req) => {
+    const success = getStore().removeSubitem(req)
+    if (success) pushState.items()
+    return success
+  })
+
+  handle('item:merge', (sourceId, targetId) => {
+    const result: MergeResult = getStore().merge(sourceId, targetId)
+    if (result.ok) {
+      pushState.items()
+    } else if (result.reason === 'full') {
+      toast(result.message || 'toast.mergeIncompatible', 'info')
+    } else if (result.reason === 'incompatible') {
+      toast(result.message || 'toast.mergeIncompatible', 'info')
+    }
+    // 'notfound' fails silently
+    return result
+  })
+
+  handle('item:split', (req) => {
+    console.log('[IPC] item:split called with req=', JSON.stringify(req))
+    const success = getStore().split(req)
+    console.log('[IPC] item:split success=', success)
+    if (success) pushState.items()
+    return success
+  })
+
+  handle('startup:refresh', async () => {
+    return refreshLaunchAtLoginFromOs()
+  })
+
+  handle('settings:update', async (patch) => {
+    // When the user explicitly picks a display, also persist its geometry so
+    // the next reboot can re-identify the monitor via fuzzy bounds matching
+    // even after Windows re-assigns numeric display IDs.
+    let enrichedPatch = { ...patch }
+    if (patch.stickDisplayId !== undefined) {
+      const displays = getDisplayListOptions()
+      const chosen = displays.find(d => d.id === patch.stickDisplayId)
+      if (chosen) {
+        // IMPORTANT: persist workArea (not bounds) — geometry.ts Tier-2 fuzzy match
+        // compares d.workArea against savedWorkArea. Using bounds (which includes the
+        // taskbar) would create a mismatch of ~40px, exceeding the 8px BOUNDS_TOLERANCE
+        // and causing Tier-2 to always fail on reboot.
+        enrichedPatch = {
+          ...enrichedPatch,
+          stickDisplayWorkArea: chosen.workArea,
+          stickDisplayScaleFactor: chosen.scaleFactor
+        }
+      }
+    }
+    let next = saveSettings(enrichedPatch)
+    if (patch.launchAtLogin !== undefined) {
+      const applied = await applyLaunchAtLogin(patch.launchAtLogin)
+      if (applied.enabled !== next.launchAtLogin) {
+        next = saveSettings({ launchAtLogin: applied.enabled })
+      }
+      if (applied.blockedByUser && patch.launchAtLogin) {
+        toast('toast.launchBlockedByWindows', 'info')
+      } else if (!applied.ok) {
+        toast('toast.launchUpdateFailed', 'error')
+      }
+    }
+    if (patch.hotZoneWidth !== undefined) {
+      setHotZoneWidth(patch.hotZoneWidth)
+    }
+    if (patch.stickPosition !== undefined || patch.stickDisplayId !== undefined || patch.verticalOffset !== undefined || patch.horizontalOffset !== undefined) {
+      repositionWindow()
+      if (patch.stickPosition !== undefined || patch.stickDisplayId !== undefined) {
+        popUpAndRetract(1500)
+      }
+    }
+    if (patch.autoUpdates !== undefined || patch.updateMode !== undefined) {
+      syncAutoUpdaterState()
+    }
+    // Switching into a checking mode checks now — previously nothing happened
+    // until the next restart. Switching to 'off' cancels any pending check.
+    if (patch.updateMode !== undefined) {
+      try {
+        triggerBackgroundCheck()
+      } catch { /* ignore */ }
+    }
+    if (patch.toggleHotkey !== undefined) {
+      registerGlobalHotkey(patch.toggleHotkey)
+    }
+    pushState.settings(next)
+    rebuildTrayMenu()
+    return next
+  })
+
+  handle('hotkey:pause', (paused) => {
+    if (paused) {
+      try {
+        const { globalShortcut } = require('electron')
+        globalShortcut.unregisterAll()
+      } catch { /* ignore */ }
+    } else {
+      registerGlobalHotkey()
+    }
+  })
+
+  handle('window:set-interactive', (value) => {
+    setInteractive(value)
+  })
+
+  handle('window:set-preview-mode', (active) => {
+    import('./window').then(m => m.setPreviewMode(active))
+  })
+
+  handle('window:minimize', () => {
+    const win = getOnboardingWindow()
+    if (win && !win.isDestroyed()) {
+      win.minimize()
+    }
+  })
+
+  handle('window:focus', async (focusable) => {
+    const want = focusable ?? true
+    traceFg(`window:focus(${want})`)
+    if (want) {
+      // Last safe instant: we cannot be foreground yet (still NOACTIVATE /
+      // non-focusable), so whatever is front is the user's app. Re-capture
+      // heals any stale open-time note.
+      try {
+        captureExternalForeground()
+      } catch { /* ignore */ }
+    }
+    // Release path fully handled inside setWindowFocusable (writes, then
+    // before/after-compared verified repair). No pre-restore here: restoring
+    // first would only mask the before-reading the repair depends on.
+    setWindowFocusable(want)
+  })
+
+  handle('displays:list', () => {
+    return getDisplayListOptions()
+  })
+}
+
+/**
+ * Register fire-and-forget (send) listeners.
+ *
+ * These use `ipcMain.on` + `event.sender` instead of `ipcMain.handle` because
+ * the drag-out gesture must be synchronous — `event.sender.startDrag(...)` only
+ * works correctly when called from the same event-loop turn as the renderer's
+ * `dragstart` event.
+ */
+function on<C extends SendChannel>(
+  channel: C,
+  fn: (sender: Electron.WebContents, ...args: SendMap[C]['args']) => void
+): void {
+  ipcMain.on(channel, (event, ...args) => fn(event.sender, ...(args as SendMap[C]['args'])))
+}
+
+export function registerSendListeners(): void {
+  on('item:start-drag', (sender, req) => {
+    console.log('[IPC] item:start-drag req=', JSON.stringify(req))
+    const resolved = resolveDragData(req)
+    if (!resolved) {
+      console.log('[IPC] start-drag: no data resolved')
+      return
+    }
+    const { data, capturedAt, subIndex } = resolved
+    console.log('[IPC] start-drag: kind=', data.kind)
+
+    // Usage accounting parity with click-to-paste: a whole-item drag counts
+    // as a use. Bumps hitCount and moves unpinned items to the top, gated
+    // behind the same movePastedToTop setting paste uses. Sub-item drags
+    // (one file out of a bundle, one image out of a collection) deliberately
+    // do not reorder history - same rule as item:paste-subitem.
+    const isWholeItemDrag = !(req.paths && req.paths.length > 0) && !req.imageId
+
+    // Pause the always-on-top heartbeat for the duration of the drag.
+    // The heartbeat fires SetWindowPos(HWND_TOPMOST) every 500 ms, which
+    // pushes our window in front of the DWM drag-ghost image — making the
+    // dragged item appear to vanish ~0.5 s into any drag gesture.
+    setHeartbeatPaused(true)
+
+    const dragStarted = startDragOut(sender, data, capturedAt, subIndex)
+    console.log('[IPC] start-drag returned, sending drag-end')
+    sender.send('item:drag-end')
+
+    // Re-enable the heartbeat now that the drag is over.
+    setHeartbeatPaused(false)
+
+    // Check if the user dropped the item back onto our window!
+    const { screen, BrowserWindow } = require('electron')
+    const point = screen.getCursorScreenPoint()
+    const win = BrowserWindow.fromWebContents(sender)
+    let isInside = false
+    if (win && !win.isDestroyed()) {
+      const bounds = win.getBounds()
+      isInside = point.x >= bounds.x && point.x <= bounds.x + bounds.width &&
+                 point.y >= bounds.y && point.y <= bounds.y + bounds.height
+      if (isInside) {
+        console.log(`[IPC] Drag ended inside window! Triggering internal-drop at x=${point.x - bounds.x}, y=${point.y - bounds.y}`)
+        sender.send('item:internal-drop', { x: point.x - bounds.x, y: point.y - bounds.y })
+      }
+    }
+
+    if (dragStarted && isWholeItemDrag && !isInside) {
+      // Usage accounting parity with click-to-paste: a whole-item drag counts
+      // as a use ONLY when successfully dropped outside into another application.
+      // Dropping back onto the shelf or cancelling does not bump hitCount.
+      if (loadSettings().movePastedToTop !== false && getStore().get(req.id)) {
+        getStore().touch(req.id)
+      }
+      // 'usage' reason: this push is bookkeeping from a manual drag-out, so
+      // the renderer must NOT flash the capture copy-indicator for it.
+      pushState.items({ reason: 'usage' })
+    }
+  })
+
+  on('item:prestage-drag', (_sender, req) => {
+    prestageDrag(req)
+  })
+}
+
+/**
+ * Write any item payload back onto the system clipboard.
+ *
+ * CONTRACT: every kind resolves its concrete files through the SAME staging
+ * engine the native drag-out uses (`stageDragFile`), so paste and drag can
+ * never disagree about filenames or content. Returns false when nothing was
+ * written (e.g. every source image vanished from disk) so callers can show an
+ * explicit error instead of silently degrading quality.
+ */
+export async function writeItemToClipboard(data: ItemData, capturedAt?: number): Promise<boolean> {
+  switch (data.kind) {
+    case 'text': {
+      const formatted = formatTabularDataForClipboard(data.text, data.html)
+      clipboard.clear()
+      clipboard.write({ text: formatted.text, html: formatted.html })
+      return true
+    }
+
+    case 'image': {
+      // Fix: recover via directory scan before giving up; abort explicitly
+      // when the original is unrecoverable instead of pasting a blurry
+      // low-res preview.
+      const src = getStore().resolveStoredImagePath(data.imageId, data.ext)
+      if (!src) return false
+
+      const staged = stageDragFile(data, capturedAt)
+      if (staged?.file && existsSync(staged.file)) {
+        // Full-res bitmap + friendly-named file reference in one atomic
+        // multi-format write, so Explorer keeps "Screenshot …" naming while
+        // pixel-oriented apps get CF_DIB.
+        const named = toUnpackagedFilePath(staged.file)
+        if (await writeImageWithNamedFile(toUnpackagedFilePath(src), named)) return true
+      }
+      // Fallback: full-resolution bitmap only (no filename reference).
+      return writeImageToClipboard(src)
+    }
+
+    case 'image-collection': {
+      // Fix: stage through the shared engine so every file gets the same
+      // indexed pretty names drag-out produces ("Screenshot … (2).png")
+      // instead of raw storage ids ("<hex>.png").
+      const staged = stageDragFile(data, capturedAt)
+      const stagedFiles = staged?.files ?? []
+      if (stagedFiles.length === 0) return false
+
+      const firstImg = data.images[0]
+      const firstSrc = firstImg
+        ? getStore().resolveStoredImagePath(firstImg.imageId, firstImg.ext)
+        : null
+
+      if (stagedFiles.length === 1 && firstSrc) {
+        const named = toUnpackagedFilePath(stagedFiles[0])
+        if (await writeImageWithNamedFile(toUnpackagedFilePath(firstSrc), named)) return true
+        return writeImageToClipboard(firstSrc)
+      }
+
+      if (!firstSrc) {
+        // No bitmap recoverable — the surviving named file references are
+        // still perfectly valid for Explorer-style targets.
+        return writeFileListToClipboard(stagedFiles)
+      }
+
+      // Multi-file: all pretty-named refs + first image as bitmap.
+      try {
+        const exposed = stagedFiles.map((p) => toUnpackagedFilePath(p))
+        const addLines = exposed
+          .map(p => `$c.Add([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${Buffer.from(p, 'utf8').toString('base64')}')))|Out-Null`)
+          .join(';')
+        const b64First = Buffer.from(toUnpackagedFilePath(firstSrc), 'utf8').toString('base64')
+        const script = [
+          'Add-Type -AssemblyName System.Windows.Forms',
+          'Add-Type -AssemblyName System.Drawing',
+          `$fp=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64First}'))`,
+          '$bmp=[Drawing.Image]::FromFile($fp)',
+          '$d=New-Object Windows.Forms.DataObject',
+          '$d.SetImage($bmp)',
+          '$c=New-Object System.Collections.Specialized.StringCollection',
+          addLines,
+          '$d.SetFileDropList($c)',
+          '[Windows.Forms.Clipboard]::SetDataObject($d,$true)',
+          '$bmp.Dispose()'
+        ].join(';')
+        await psHost.run(script, 3000)
+      } catch (err) {
+        console.error('[ipc] image-collection clipboard write failed:', err)
+        // Full-resolution fallback for the first image (never a low-res preview).
+        return writeImageToClipboard(firstSrc)
+      }
+      return true
+    }
+
+    case 'files':
+      // Write real file references so pasting into Explorer copies the files,
+      // not path strings.
+      return writeFileListToClipboard(data.paths)
+  }
+}

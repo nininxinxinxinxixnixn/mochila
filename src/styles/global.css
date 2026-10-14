@@ -1,0 +1,149 @@
+/**
+ * Global reset + base rules.
+ *
+ * The renderer root is transparent (the window itself is transparent), so we
+ * never paint a body background — the blade paints itself via the Panel
+ * component. Text selection and native drag ghosts are disabled everywhere so
+ * the only drags are the ones we explicitly start.
+ */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  width: 100%;
+}
+
+html {
+  /* The window is click-through; let pointer events flow but keep our own UI
+     interactive when the blade is open. */
+  background: transparent;
+}
+
+body {
+  font-family: var(--font-ui);
+  font-size: calc(14px * var(--font-scale, 1));
+  line-height: 1.45;
+  letter-spacing: 0;
+  font-weight: 400;
+  color: var(--text-primary);
+  background: transparent;
+  overflow: hidden;
+  /* No font-smoothing/rendering overrides: the OS default (ClearType on
+     Windows) is the sharp path, matching every native element next to us.
+     Forced grayscale AA + geometricPrecision visibly softens glyphs,
+     worst on high-DPI displays. */
+  font-feature-settings: 'ss01' 1;
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: default;
+}
+
+/* No native drag ghosts on media (we own dragging via IPC for items).
+   NOTE: do NOT apply -webkit-user-drag: none to '*' — that disables
+   dragstart on every element, which breaks our draggable item tiles and
+   file sub-rows. Scope it to img/a only, and let .item-main / .file-row
+   re-enable dragging explicitly. */
+img,
+video {
+  image-rendering: auto;
+}
+
+svg {
+  overflow: visible;
+}
+
+.blade,
+.item,
+.item-main,
+.filter-segmented-track,
+.act,
+.icon-btn,
+.preview-flyout,
+.indicator-flyout,
+.settings-sheet,
+.pinned-count-badge,
+.thumb-wrap,
+.thumb,
+.kind-badge,
+.copy-curve-container,
+.style-card {
+  -webkit-background-clip: padding-box;
+  background-clip: padding-box;
+}
+
+/* All flyout preview containers hide visible scrollbars while maintaining scroll functionality */
+.preview-flyout,
+.preview-flyout *,
+.language-flyout,
+.language-flyout * {
+  scrollbar-width: none !important;
+  -ms-overflow-style: none !important;
+}
+
+.preview-flyout::-webkit-scrollbar,
+.preview-flyout *::-webkit-scrollbar,
+.language-flyout::-webkit-scrollbar,
+.language-flyout *::-webkit-scrollbar {
+  display: none !important;
+  width: 0 !important;
+  height: 0 !important;
+}
+
+img,
+a {
+  -webkit-user-drag: none;
+}
+
+/* Draggable surfaces opt into dragging only when explicitly marked draggable */
+.item-main[draggable="true"],
+.file-row {
+  -webkit-user-drag: element;
+}
+
+.item-main[draggable="false"],
+.item-main:not([draggable="true"]) {
+  -webkit-user-drag: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+
+input {
+  font: inherit;
+  color: inherit;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.22);
+}
+
+/* Respect OS reduced-motion when the user opts in via settings. */
+:root[data-motion='reduce'] * {
+  transition-duration: 0.01ms !important;
+  animation-duration: 0.01ms !important;
+}

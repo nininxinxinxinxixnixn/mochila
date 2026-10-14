@@ -1,0 +1,25 @@
+import { describe, expect, it, vi } from 'vitest'
+import { ClipboardWriter } from '../electron/mochila/ClipboardWriter'
+import { PasteCoordinator } from '../electron/mochila/PasteCoordinator'
+import { QueueModel } from '../electron/mochila/QueueModel'
+import type { MochilaEntry } from '../shared/mochila'
+const e = (id: string): MochilaEntry => ({ id, title: id, source: 'clipboard', createdAt: 'now', payload: { kind: 'text', text: id }, bytes: 1 })
+const tick = () => new Promise<void>(done => setImmediate(done))
+const fixture = () => { const ports = { assertStoredFile: vi.fn(async () => {}), writeText: vi.fn(), writeImageFile: vi.fn(), writeFiles: vi.fn(async () => {}) }; return { ports, writer: new ClipboardWriter(ports) } }
+describe('single-channel clipboard preparation', () => {
+  it('a screenshot prepares only an image, without a second file-drop channel', async () => { const f = fixture(); await f.writer.write({ ...e('image'), payload: { kind: 'image', paths: ['managed.png'] } }); expect(f.ports.writeImageFile).toHaveBeenCalledTimes(1); expect(f.ports.writeFiles).not.toHaveBeenCalled(); expect(f.ports.writeText).not.toHaveBeenCalled() })
+  it('rich text is delivered as one complete plain-text payload', async () => { const f = fixture(); const text = 'ñ 👋\n'.repeat(20000); await f.writer.write({ ...e('text'), payload: { kind: 'text', text, html: '<b>different formatting</b>' } }); expect(f.ports.writeText).toHaveBeenCalledExactlyOnceWith(text); expect(f.ports.writeImageFile).not.toHaveBeenCalled(); expect(f.ports.writeFiles).not.toHaveBeenCalled() })
+  it('PDF/audio/video remain a single file-list operation', async () => { const f = fixture(); await f.writer.write({ ...e('files'), payload: { kind: 'files', paths: ['x.pdf', 'y.wav', 'z.mp4'] } }); expect(f.ports.writeFiles).toHaveBeenCalledExactlyOnceWith(['x.pdf', 'y.wav', 'z.mp4']); expect(f.ports.assertStoredFile).toHaveBeenCalledTimes(3); expect(f.ports.writeImageFile).not.toHaveBeenCalled() })
+  it('a missing managed file fails before touching the clipboard', async () => { const f = fixture(); f.ports.assertStoredFile.mockRejectedValue(new Error('missing')); await expect(f.writer.write({ ...e('image'), payload: { kind: 'image', paths: ['missing.png'] } })).rejects.toThrow(); expect(f.ports.writeImageFile).not.toHaveBeenCalled(); expect(f.ports.writeFiles).not.toHaveBeenCalled() })
+})
+describe('serialized gestures with a real queue model and controlled writer', () => {
+  it('queues three rapid physical requests, preserving FIFO without overlapping clipboard writes', async () => {
+    const q = new QueueModel({ schema: 1, queue: ['a', 'b', 'c'].map(e), history: [] }, () => {}); q.arm(null)
+    const releases: (() => void)[] = []; const delivered: string[] = []; const failed = vi.fn()
+    const coordinator = new PasteCoordinator(() => q.armed, async () => { const entry = q.first()!; delivered.push(entry.id); await new Promise<void>(done => releases.push(done)); q.attempted(entry.id) }, failed)
+    coordinator.request(); coordinator.request(); coordinator.request(); expect(delivered).toEqual(['a']); releases.shift()!(); await tick(); expect(delivered).toEqual(['a', 'b']); releases.shift()!(); await tick(); releases.shift()!(); await tick(); expect(delivered).toEqual(['a', 'b', 'c']); expect(q.snapshot().history.map(h => h.entry.id)).toEqual(delivered); expect(failed).not.toHaveBeenCalled()
+  })
+  it('pause cancels queued gestures and does not replay them after rearming', async () => { const q = new QueueModel({ schema: 1, queue: ['a', 'b'].map(e), history: [] }, () => {}); q.arm(null); let release!: () => void; const send = vi.fn(async () => { await new Promise<void>(done => { release = done }) }); const coordinator = new PasteCoordinator(() => q.armed, send, () => {}); coordinator.request(); coordinator.request(); q.pause(); coordinator.cancel(); release(); await tick(); q.arm(null); expect(send).toHaveBeenCalledTimes(1); expect(q.snapshot().queue).toHaveLength(2) })
+  it('an error reports once and preserves the next item without automatic retry', async () => { const q = new QueueModel({ schema: 1, queue: ['a', 'b'].map(e), history: [] }, () => {}); q.arm(null); const failure = vi.fn(() => q.pause()); const send = vi.fn(async () => { throw new Error('clipboard failed') }); const coordinator = new PasteCoordinator(() => q.armed, send, failure); coordinator.request(); coordinator.request(); await tick(); expect(send).toHaveBeenCalledTimes(1); expect(failure).toHaveBeenCalledTimes(1); expect(q.first()?.id).toBe('a'); expect(q.snapshot().history).toEqual([]) })
+  it('stops a burst at the selected limit without consuming subsequent entries', async () => { const q = new QueueModel({ schema: 1, queue: ['a', 'b', 'c'].map(e), history: [] }, () => {}); q.arm(1); const coordinator = new PasteCoordinator(() => q.armed, async () => { q.attempted(q.first()!.id) }, () => {}); coordinator.request(); coordinator.request(); await tick(); expect(q.snapshot().history).toHaveLength(1); expect(q.snapshot().queue.map(e => e.id)).toEqual(['b', 'c']) })
+})

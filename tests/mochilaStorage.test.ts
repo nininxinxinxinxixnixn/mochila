@@ -1,0 +1,21 @@
+import { afterEach, describe, expect, it } from 'vitest'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { join, resolve, sep } from 'node:path'
+import { mkdirSync, readFileSync } from 'node:fs'
+import { DiskQueue } from '../electron/mochila/DiskQueue'
+import { AssetVault } from '../electron/mochila/AssetVault'
+import type { MochilaDocument } from '../shared/mochila'
+const roots: string[] = []
+const testRoot = join(process.cwd(), 'scratch', 'mochila-tests'); mkdirSync(testRoot, { recursive: true })
+const fresh = async () => { const root = await mkdtemp(join(testRoot, 'case-')); roots.push(root); return root }
+const codec = { encode: (text: string) => Buffer.from(text), decode: (data: Buffer) => data.toString() }
+afterEach(async () => { for (const root of roots.splice(0)) { if (!resolve(root).startsWith(resolve(testRoot) + sep)) throw new Error('Invalid test cleanup target'); await rm(root, { recursive: true, force: true }) } })
+describe('Mochila asset and disk readback', () => {
+  it('roundtrips pending entries and attempt history from the exact disk file', async () => { const root = await fresh(); const vault = new AssetVault(join(root, 'vault')); const e = await vault.capture({ kind: 'text', text: 'ñ\ncontexto', isUrl: false }, 'manual'); const d: MochilaDocument = { schema: 1, queue: [e], history: [] }; const file = join(root, 'mochila.queue'); const disk = new DiskQueue(file, codec); disk.save(d); expect(new DiskQueue(file, codec).load()).toEqual(d); expect(JSON.parse(readFileSync(file, 'utf8')).queue[0].payload.text).toBe('ñ\ncontexto') })
+  it('preserves a corrupt original instead of silently replacing it', async () => { const root = await fresh(); const file = join(root, 'mochila.queue'); await writeFile(file, 'corrupt original'); const disk = new DiskQueue(file, codec); expect(() => disk.load()).toThrow(); expect(await readFile(file, 'utf8')).toBe('corrupt original') })
+  it('snapshots files without moving their source and survives source removal', async () => { const root = await fresh(); const original = join(root, 'audio-test.wav'); const bytes = Buffer.from('synthetic audio payload'); await writeFile(original, bytes); const vault = new AssetVault(join(root, 'vault')); const e = await vault.capture({ kind: 'files', paths: [original] }, 'drop'); expect(await readFile(original)).toEqual(bytes); expect(e.payload.kind).toBe('files'); if (e.payload.kind === 'files') { await rm(original); expect(vault.owns(e.payload.paths[0])).toBe(true); expect(await readFile(e.payload.paths[0])).toEqual(bytes); expect(e.bytes).toBe(bytes.length) } })
+  it('stores supplied PNG bytes in a managed path', async () => { const root = await fresh(); const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==', 'base64'); const vault = new AssetVault(join(root, 'vault')); const e = await vault.capture({ kind: 'image', imageId: '', width: 1, height: 1, bytes: png.length }, 'clipboard', png); expect(e.payload.kind).toBe('image'); if (e.payload.kind === 'image') expect(await readFile(e.payload.paths[0])).toEqual(png) })
+  it('separates repeated captures and same-named files', async () => { const root = await fresh(); const a = join(root, 'same.txt'); await writeFile(a, 'one'); const vault = new AssetVault(join(root, 'vault')); const first = await vault.capture({ kind: 'files', paths: [a, a] }, 'drop'); const second = await vault.capture({ kind: 'files', paths: [a] }, 'drop'); expect(first.id).not.toBe(second.id); if (first.payload.kind === 'files') expect(new Set(first.payload.paths).size).toBe(2) })
+  it('rejects folders and missing files without inventing a successful entry', async () => { const root = await fresh(); const vault = new AssetVault(join(root, 'vault')); await expect(vault.capture({ kind: 'files', paths: [root] }, 'drop')).rejects.toThrow('carpetas'); await expect(vault.capture({ kind: 'files', paths: [join(root, 'missing.pdf')] }, 'drop')).rejects.toThrow() })
+  it('does not admit a traversal outside its asset root', async () => { const root = await fresh(); const vault = new AssetVault(join(root, 'vault')); expect(vault.owns(join(root, 'vault', '..', 'private.txt'))).toBe(false); expect(vault.owns(join(root, 'vault-neighbor', 'private.txt'))).toBe(false) })
+})

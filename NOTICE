@@ -1,0 +1,20 @@
+Mochila 0.3.0 — Windows development candidate, 2026.
+
+Derived from Edge-Drop by Deepender25 and contributors.
+Original source: https://github.com/Deepender25/Edge-Drop
+Baseline commit: 469fd0d56d8d4073ed5a6fbcab36953db8203cae
+Original and derivative source are provided under the Apache License 2.0.
+The original LICENSE is retained unchanged. Original notices in source are retained.
+
+Changes: independent Mochila application identity and startup, persistent FIFO
+queue, managed copies of assets, guarded paste attempts, Spanish interface,
+original vector mascot, tests, documentation and Windows development package.
+0.2.0 adds an animated zipper controlling collection/delivery, direct intake
+while collapsed, and a separate button for the queue/history panel.
+No affiliation with or endorsement from the original authors is claimed.
+
+Third-party dependencies retain their own licences and notices. A complete
+dependency and asset licence audit is pending before public distribution.
+
+0.3.0 adds direct mascot drag, recoverable intake editing, native file-list
+clipboard preparation, controlled automatic delivery and prepared MegaPrompt.
